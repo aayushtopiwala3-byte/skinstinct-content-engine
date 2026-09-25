@@ -38,29 +38,46 @@ async function processUpdate(update) {
   const text = (message.text || '').trim();
   if (!text) return;
 
-  if (message.reply_to_message) {
-    await handleDecision(message);
+  const upperText = text.toUpperCase();
+  if (upperText === 'APPROVE' || upperText === 'REJECT') {
+    await handleDecision(message, upperText);
     return;
   }
+
+  // A reply that isn't APPROVE/REJECT is commentary on a draft, not a new note — ignore it.
+  if (message.reply_to_message) return;
 
   await handleNewNote(chatId, message, text);
 }
 
-async function handleDecision(message) {
-  const decision = message.text.trim().toUpperCase();
-  if (decision !== 'APPROVE' && decision !== 'REJECT') return;
-
+async function handleDecision(message, decision) {
   const supabase = getSupabase();
-  const repliedToId = message.reply_to_message.message_id;
 
-  const { data: draft, error } = await supabase
-    .from('drafts')
-    .select('id, status')
-    .eq('telegram_message_id', repliedToId)
-    .maybeSingle();
+  let draft = null;
+  if (message.reply_to_message) {
+    const { data } = await supabase
+      .from('drafts')
+      .select('id, status')
+      .eq('telegram_message_id', message.reply_to_message.message_id)
+      .maybeSingle();
+    draft = data;
+  }
 
-  if (error || !draft) {
-    console.log('no matching draft for reply', repliedToId, error);
+  // Telegram doesn't always attach reply_to_message for in-channel replies, so fall back
+  // to the most recent still-pending draft in this chat (only one chat is ever processed).
+  if (!draft) {
+    const { data } = await supabase
+      .from('drafts')
+      .select('id, status')
+      .eq('status', 'pending')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    draft = data;
+  }
+
+  if (!draft) {
+    console.log('no pending draft found for decision', decision);
     return;
   }
 
@@ -127,10 +144,12 @@ async function handleNewNote(chatId, message, text) {
   }
 
   let newsAngle = null;
+  let newsSources = [];
   try {
     const angleResult = await findNewsAngle(text, scoring.keywords || []);
     if (angleResult?.hasAngle && angleResult.angle) {
       newsAngle = angleResult.angle;
+      newsSources = angleResult.sources || [];
     }
   } catch (err) {
     console.error('news angle lookup failed, continuing without it', err);
@@ -161,12 +180,21 @@ async function handleNewNote(chatId, message, text) {
 
   await supabase
     .from('notes')
-    .update({ status: 'drafted', score: scoring.score, news_angle: newsAngle })
+    .update({
+      status: 'drafted',
+      score: scoring.score,
+      news_angle: newsAngle,
+      news_sources: newsSources.length ? newsSources : null,
+    })
     .eq('id', note.id);
+
+  const sourcesBlock = newsSources.length
+    ? `\n\nSources:\n${newsSources.map((s) => `- ${s.title}: ${s.uri}`).join('\n')}`
+    : '';
 
   const sent = await sendMessage(
     chatId,
-    `${draftText}\n\nReply APPROVE or REJECT to this message.`,
+    `Score: ${scoring.score}/10\n\n${draftText}${sourcesBlock}\n\nReply APPROVE or REJECT to this message.`,
     message.message_id
   );
 

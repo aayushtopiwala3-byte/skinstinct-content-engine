@@ -16,6 +16,7 @@ create table if not exists notes (
   score int,
   reject_reason text,
   news_angle text,
+  news_sources jsonb,
   created_at timestamptz not null default now()
 );
 
